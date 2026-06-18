@@ -23,47 +23,21 @@ def save_config(cfg):
 config = load_config()
 
 # ─────────────────────────────────────────
-#  PERMISSIONS / OWNERS
+#  PERMISSIONS
 # ─────────────────────────────────────────
 
 # Créateur du bot / acheteur : a TOUJOURS tous les droits, sur tous les serveurs.
-# Cet ID ne peut pas être retiré et ne dépend pas du fichier config.json.
-SUPER_OWNER_ID = 1304452148779814915
-
-def get_owners():
-    """Liste des IDs ayant tous les droits en plus du créateur."""
-    return config.get("owners", [])
-
-def is_full_access(user_id):
-    """True si l'utilisateur est le créateur ou a été promu owner via !owner."""
-    return user_id == SUPER_OWNER_ID or user_id in get_owners()
+CREATOR_ID = 1304452148779814915
 
 def is_authorized():
-    """Check pour les commandes de gestion de serveur :
-    accessible aux owners (tous serveurs) OU aux membres avec 'Gérer le serveur'."""
+    """Accessible uniquement au créateur du bot OU aux membres avec
+    la permission 'Gérer le serveur' sur le serveur où la commande est tapée."""
     async def predicate(ctx):
-        if is_full_access(ctx.author.id):
+        if ctx.author.id == CREATOR_ID:
             return True
         if ctx.guild and ctx.author.guild_permissions.manage_guild:
             return True
         raise commands.MissingPermissions(["manage_guild"])
-    return commands.check(predicate)
-
-def is_full_owner():
-    """Check pour les commandes globales du bot (pp, banner, bio...) :
-    réservé au créateur et aux owners qu'il a promus."""
-    async def predicate(ctx):
-        if is_full_access(ctx.author.id):
-            return True
-        raise commands.NotOwner()
-    return commands.check(predicate)
-
-def is_super_owner():
-    """Check réservé STRICTEMENT au créateur du bot (ex: gestion des owners)."""
-    async def predicate(ctx):
-        if ctx.author.id == SUPER_OWNER_ID:
-            return True
-        raise commands.NotOwner()
     return commands.check(predicate)
 
 intents = discord.Intents.all()
@@ -720,11 +694,11 @@ class ReactAutoView(discord.ui.View):
 
 
 # ─────────────────────────────────────────
-#  COMMANDES — PERSONNALISATION DU BOT (owner only)
+#  COMMANDES — PERSONNALISATION DU BOT (admins + créateur)
 # ─────────────────────────────────────────
 
 @bot.command(name="setpp")
-@is_full_owner()
+@is_authorized()
 async def setpp_cmd(ctx, url: str = None):
     """Change la photo de profil du bot. Lien direct ou image en pièce jointe."""
     image_bytes = await get_image_from_ctx(ctx, url)
@@ -737,7 +711,7 @@ async def setpp_cmd(ctx, url: str = None):
         await ctx.send(embed=e_err(f"Discord a refusé l'image ({e})."))
 
 @bot.command(name="setbanner")
-@is_full_owner()
+@is_authorized()
 async def setbanner_cmd(ctx, url: str = None):
     """Change la bannière du bot. Lien direct ou image en pièce jointe."""
     image_bytes = await get_image_from_ctx(ctx, url)
@@ -750,7 +724,7 @@ async def setbanner_cmd(ctx, url: str = None):
         await ctx.send(embed=e_err(f"Discord a refusé l'image ({e})."))
 
 @bot.command(name="setbio")
-@is_full_owner()
+@is_authorized()
 async def setbio_cmd(ctx, *, texte: str = None):
     """Change la bio (description) du bot affichée sur son profil."""
     if not texte:
@@ -762,41 +736,6 @@ async def setbio_cmd(ctx, *, texte: str = None):
         await ctx.send(embed=e_ok("Bio mise à jour !", texte))
     except discord.HTTPException as e:
         await ctx.send(embed=e_err(f"Discord a refusé la modification ({e})."))
-
-
-# ─────────────────────────────────────────
-#  COMMANDE — GESTION DES OWNERS (créateur uniquement)
-# ─────────────────────────────────────────
-
-@bot.command(name="owner")
-@is_super_owner()
-async def owner_cmd(ctx, member: discord.Member = None, action: str = None):
-    """!owner @membre → donne tous les droits. !owner @membre remove → les retire. !owner → liste."""
-    owners = get_owners()
-
-    # Pas de membre fourni → affiche la liste
-    if member is None:
-        lines = [f"<@{SUPER_OWNER_ID}> *(créateur, fixe)*"]
-        for uid in owners:
-            lines.append(f"<@{uid}>")
-        return await ctx.send(embed=e_info("👑 Owners (all perms)", "\n".join(lines)))
-
-    if member.id == SUPER_OWNER_ID:
-        return await ctx.send(embed=e_err("Cette personne a déjà tous les droits en permanence."))
-
-    if action and action.lower() in ("remove", "del", "delete", "retirer"):
-        if member.id in owners:
-            owners.remove(member.id)
-            config["owners"] = owners
-            save_config(config)
-            return await ctx.send(embed=e_ok(f"{member.mention} n'a plus tous les droits."))
-        return await ctx.send(embed=e_err(f"{member.mention} n'était pas owner."))
-
-    if member.id not in owners:
-        owners.append(member.id)
-        config["owners"] = owners
-        save_config(config)
-    await ctx.send(embed=e_ok(f"{member.mention} a maintenant **tous les droits** (all perms) sur le bot !"))
 
 
 # ─────────────────────────────────────────
@@ -841,15 +780,10 @@ async def help_cmd(ctx):
     embed.add_field(name="⚙️ !config", value="Voir toute la configuration actuelle", inline=False)
     embed.add_field(name="🧪 !testwelcome", value="Simuler une arrivée de membre", inline=False)
     embed.add_field(
-        name="🎨 Personnalisation du bot (owners uniquement)",
+        name="🎨 Personnalisation du bot (admins + créateur)",
         value="`!setpp <lien ou image>` — photo de profil\n"
               "`!setbanner <lien ou image>` — bannière\n"
               "`!setbio <texte>` — bio / description",
-        inline=False
-    )
-    embed.add_field(
-        name="👑 !owner <@membre> [remove]",
-        value="Donne ou retire **tous les droits** à quelqu'un — réservé au créateur du bot",
         inline=False
     )
     embed.set_footer(text="Préfixe : !")
@@ -883,8 +817,6 @@ async def test_welcome(ctx):
 async def on_command_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
         await ctx.send(embed=e_err("Permission refusée."))
-    elif isinstance(error, commands.NotOwner):
-        await ctx.send(embed=e_err("Commande réservée au propriétaire du bot."))
     elif isinstance(error, commands.MissingRequiredArgument):
         await ctx.send(embed=e_err("Argument manquant. Tape `!help`"))
     elif isinstance(error, commands.BadArgument):
