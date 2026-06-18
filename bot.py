@@ -63,6 +63,17 @@ async def wait_response(bot, author, channel, timeout=60):
     except asyncio.TimeoutError:
         return None
 
+def parse_emoji_token(token):
+    """Convertit un token texte (emoji unicode ou <:nom:id> / <a:nom:id>)
+    en quelque chose d'utilisable par message.add_reaction()."""
+    token = token.strip()
+    if token.startswith("<") and token.endswith(">"):
+        try:
+            return discord.PartialEmoji.from_str(token)
+        except Exception:
+            return token
+    return token
+
 # ─────────────────────────────────────────
 #  EVENTS
 # ─────────────────────────────────────────
@@ -181,6 +192,16 @@ async def on_message(message):
             w = await message.channel.send(f"{member.mention} ❌ Les liens sont interdits ici !")
         await w.delete(delay=5)
         return
+
+    # ── React Auto ──
+    reactauto_cfg = cfg.get("reactauto", {})
+    emojis = reactauto_cfg.get(str(message.channel.id))
+    if emojis:
+        for token in emojis:
+            try:
+                await message.add_reaction(parse_emoji_token(token))
+            except Exception:
+                pass
 
     await bot.process_commands(message)
 
@@ -440,6 +461,104 @@ class ModView(discord.ui.View):
         await self._handle_protection(interaction, "antilink", "Anti-link", 2, 10, 60)
 
 
+# ═══════════════════════════════════════════════════════════
+#  VIEW : !reactauto  (Réactions automatiques par salon)
+# ═══════════════════════════════════════════════════════════
+
+def build_reactauto_embed(cfg, guild):
+    embed = discord.Embed(
+        title="🤖 Config — Réactions automatiques",
+        description="Le bot ajoute automatiquement une réaction à **chaque message** posté dans les salons configurés.\nChangements sauvegardés **immédiatement**.",
+        color=0xf1c40f
+    )
+    reactauto = cfg.get("reactauto", {})
+    if not reactauto:
+        embed.add_field(name="📋 Salons configurés", value="*(aucun)*", inline=False)
+    else:
+        lines = []
+        for cid, emojis in reactauto.items():
+            lines.append(f"<#{cid}> → {' '.join(emojis)}")
+        embed.add_field(name="📋 Salons configurés", value="\n".join(lines), inline=False)
+
+    embed.set_footer(text="Expire dans 5 min")
+    return embed
+
+
+class ReactAutoView(discord.ui.View):
+    def __init__(self, cfg, guild, author):
+        super().__init__(timeout=300)
+        self.cfg    = cfg
+        self.guild  = guild
+        self.author = author
+
+    def is_author(self, interaction):
+        return interaction.user.id == self.author.id
+
+    async def _refresh(self, interaction):
+        await interaction.message.edit(
+            embed=build_reactauto_embed(self.cfg, self.guild),
+            view=ReactAutoView(self.cfg, self.guild, self.author)
+        )
+
+    # ── Ajouter / Modifier ──
+    @discord.ui.button(label="➕ Ajouter salon", style=discord.ButtonStyle.success, row=0)
+    async def btn_add(self, interaction: discord.Interaction, _):
+        if not self.is_author(interaction): return await interaction.response.send_message("❌", ephemeral=True)
+        await interaction.response.send_message(
+            "Mentionne le **salon** puis le(s) **emoji(s)** à la suite, séparés par des espaces.\n"
+            "Ex : `#annonces 👍 🎉` ou `#general <:pouce:123456789012345678>`",
+            ephemeral=True
+        )
+        msg = await wait_response(bot, self.author, interaction.channel)
+        if not msg: return
+
+        if not msg.channel_mentions:
+            try: await msg.delete()
+            except: pass
+            return await interaction.followup.send(embed=e_err("Aucun salon mentionné."), ephemeral=True)
+
+        channel = msg.channel_mentions[0]
+        content = msg.content.replace(channel.mention, "").replace(f"<#{channel.id}>", "")
+        emojis = content.strip().split()
+
+        if not emojis:
+            try: await msg.delete()
+            except: pass
+            return await interaction.followup.send(embed=e_err("Aucun emoji fourni."), ephemeral=True)
+
+        if "reactauto" not in self.cfg:
+            self.cfg["reactauto"] = {}
+        self.cfg["reactauto"][str(channel.id)] = emojis
+        save_config(config)
+        try: await msg.delete()
+        except: pass
+        await self._refresh(interaction)
+
+    # ── Retirer ──
+    @discord.ui.button(label="➖ Retirer salon", style=discord.ButtonStyle.danger, row=0)
+    async def btn_remove(self, interaction: discord.Interaction, _):
+        if not self.is_author(interaction): return await interaction.response.send_message("❌", ephemeral=True)
+        await interaction.response.send_message("Mentionne le **salon** à retirer :", ephemeral=True)
+        msg = await wait_response(bot, self.author, interaction.channel)
+        if not msg: return
+        if msg.channel_mentions:
+            cid = str(msg.channel_mentions[0].id)
+            self.cfg.get("reactauto", {}).pop(cid, None)
+            save_config(config)
+        try: await msg.delete()
+        except: pass
+        await self._refresh(interaction)
+
+    # ── Tout effacer ──
+    @discord.ui.button(label="🗑️ Tout effacer", style=discord.ButtonStyle.secondary, row=0)
+    async def btn_clear(self, interaction: discord.Interaction, _):
+        if not self.is_author(interaction): return await interaction.response.send_message("❌", ephemeral=True)
+        self.cfg["reactauto"] = {}
+        save_config(config)
+        await interaction.response.send_message(embed=e_ok("Toutes les réactions auto ont été supprimées."), ephemeral=True)
+        await self._refresh(interaction)
+
+
 # ─────────────────────────────────────────
 #  COMMANDES PRINCIPALES
 # ─────────────────────────────────────────
@@ -458,11 +577,19 @@ async def mod_cmd(ctx):
     cfg = guild_config(ctx.guild.id)
     await ctx.send(embed=build_mod_embed(cfg), view=ModView(cfg, ctx.author))
 
+@bot.command(name="reactauto")
+@commands.has_permissions(manage_guild=True)
+async def reactauto_cmd(ctx):
+    """Panneau config réactions automatiques."""
+    cfg = guild_config(ctx.guild.id)
+    await ctx.send(embed=build_reactauto_embed(cfg, ctx.guild), view=ReactAutoView(cfg, ctx.guild, ctx.author))
+
 @bot.command(name="help")
 async def help_cmd(ctx):
     embed = discord.Embed(title="📖 Commandes disponibles", color=0x9b59b6)
     embed.add_field(name="🎉 !join", value="Panneau interactif : salon bienvenue, message, MP, rôle auto, image only", inline=False)
     embed.add_field(name="🛡️ !mod", value="Panneau interactif : anti-spam, anti-mention, anti-link", inline=False)
+    embed.add_field(name="🤖 !reactauto", value="Panneau interactif : réactions automatiques par salon", inline=False)
     embed.add_field(name="⚙️ !config", value="Voir toute la configuration actuelle", inline=False)
     embed.add_field(name="🧪 !testwelcome", value="Simuler une arrivée de membre", inline=False)
     embed.set_footer(text="Préfixe : !")
@@ -476,7 +603,9 @@ async def config_cmd(ctx):
     e1.title = "⚙️ Config — Arrivée"
     e2 = build_mod_embed(cfg)
     e2.title = "⚙️ Config — Modération"
-    await ctx.send(embeds=[e1, e2])
+    e3 = build_reactauto_embed(cfg, ctx.guild)
+    e3.title = "⚙️ Config — Réactions auto"
+    await ctx.send(embeds=[e1, e2, e3])
 
 @bot.command(name="testwelcome")
 @commands.has_permissions(manage_guild=True)
