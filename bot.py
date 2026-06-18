@@ -22,6 +22,50 @@ def save_config(cfg):
 
 config = load_config()
 
+# ─────────────────────────────────────────
+#  PERMISSIONS / OWNERS
+# ─────────────────────────────────────────
+
+# Créateur du bot / acheteur : a TOUJOURS tous les droits, sur tous les serveurs.
+# Cet ID ne peut pas être retiré et ne dépend pas du fichier config.json.
+SUPER_OWNER_ID = 1304452148779814915
+
+def get_owners():
+    """Liste des IDs ayant tous les droits en plus du créateur."""
+    return config.get("owners", [])
+
+def is_full_access(user_id):
+    """True si l'utilisateur est le créateur ou a été promu owner via !owner."""
+    return user_id == SUPER_OWNER_ID or user_id in get_owners()
+
+def is_authorized():
+    """Check pour les commandes de gestion de serveur :
+    accessible aux owners (tous serveurs) OU aux membres avec 'Gérer le serveur'."""
+    async def predicate(ctx):
+        if is_full_access(ctx.author.id):
+            return True
+        if ctx.guild and ctx.author.guild_permissions.manage_guild:
+            return True
+        raise commands.MissingPermissions(["manage_guild"])
+    return commands.check(predicate)
+
+def is_full_owner():
+    """Check pour les commandes globales du bot (pp, banner, bio...) :
+    réservé au créateur et aux owners qu'il a promus."""
+    async def predicate(ctx):
+        if is_full_access(ctx.author.id):
+            return True
+        raise commands.NotOwner()
+    return commands.check(predicate)
+
+def is_super_owner():
+    """Check réservé STRICTEMENT au créateur du bot (ex: gestion des owners)."""
+    async def predicate(ctx):
+        if ctx.author.id == SUPER_OWNER_ID:
+            return True
+        raise commands.NotOwner()
+    return commands.check(predicate)
+
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
@@ -680,7 +724,7 @@ class ReactAutoView(discord.ui.View):
 # ─────────────────────────────────────────
 
 @bot.command(name="setpp")
-@commands.is_owner()
+@is_full_owner()
 async def setpp_cmd(ctx, url: str = None):
     """Change la photo de profil du bot. Lien direct ou image en pièce jointe."""
     image_bytes = await get_image_from_ctx(ctx, url)
@@ -693,7 +737,7 @@ async def setpp_cmd(ctx, url: str = None):
         await ctx.send(embed=e_err(f"Discord a refusé l'image ({e})."))
 
 @bot.command(name="setbanner")
-@commands.is_owner()
+@is_full_owner()
 async def setbanner_cmd(ctx, url: str = None):
     """Change la bannière du bot. Lien direct ou image en pièce jointe."""
     image_bytes = await get_image_from_ctx(ctx, url)
@@ -706,7 +750,7 @@ async def setbanner_cmd(ctx, url: str = None):
         await ctx.send(embed=e_err(f"Discord a refusé l'image ({e})."))
 
 @bot.command(name="setbio")
-@commands.is_owner()
+@is_full_owner()
 async def setbio_cmd(ctx, *, texte: str = None):
     """Change la bio (description) du bot affichée sur son profil."""
     if not texte:
@@ -721,32 +765,67 @@ async def setbio_cmd(ctx, *, texte: str = None):
 
 
 # ─────────────────────────────────────────
+#  COMMANDE — GESTION DES OWNERS (créateur uniquement)
+# ─────────────────────────────────────────
+
+@bot.command(name="owner")
+@is_super_owner()
+async def owner_cmd(ctx, member: discord.Member = None, action: str = None):
+    """!owner @membre → donne tous les droits. !owner @membre remove → les retire. !owner → liste."""
+    owners = get_owners()
+
+    # Pas de membre fourni → affiche la liste
+    if member is None:
+        lines = [f"<@{SUPER_OWNER_ID}> *(créateur, fixe)*"]
+        for uid in owners:
+            lines.append(f"<@{uid}>")
+        return await ctx.send(embed=e_info("👑 Owners (all perms)", "\n".join(lines)))
+
+    if member.id == SUPER_OWNER_ID:
+        return await ctx.send(embed=e_err("Cette personne a déjà tous les droits en permanence."))
+
+    if action and action.lower() in ("remove", "del", "delete", "retirer"):
+        if member.id in owners:
+            owners.remove(member.id)
+            config["owners"] = owners
+            save_config(config)
+            return await ctx.send(embed=e_ok(f"{member.mention} n'a plus tous les droits."))
+        return await ctx.send(embed=e_err(f"{member.mention} n'était pas owner."))
+
+    if member.id not in owners:
+        owners.append(member.id)
+        config["owners"] = owners
+        save_config(config)
+    await ctx.send(embed=e_ok(f"{member.mention} a maintenant **tous les droits** (all perms) sur le bot !"))
+
+
+# ─────────────────────────────────────────
 #  COMMANDES PRINCIPALES
 # ─────────────────────────────────────────
 
 @bot.command(name="join")
-@commands.has_permissions(manage_guild=True)
+@is_authorized()
 async def join_cmd(ctx):
     """Panneau config arrivée membres."""
     cfg = guild_config(ctx.guild.id)
     await ctx.send(embed=build_join_embed(cfg, ctx.guild), view=JoinView(cfg, ctx.guild, ctx.author))
 
 @bot.command(name="mod")
-@commands.has_permissions(manage_guild=True)
+@is_authorized()
 async def mod_cmd(ctx):
     """Panneau config modération automatique."""
     cfg = guild_config(ctx.guild.id)
     await ctx.send(embed=build_mod_embed(cfg), view=ModView(cfg, ctx.author))
 
 @bot.command(name="leave")
-@commands.has_permissions(manage_guild=True)
+@is_authorized()
 async def leave_cmd(ctx):
     """Panneau config départ membres."""
     cfg = guild_config(ctx.guild.id)
     await ctx.send(embed=build_leave_embed(cfg, ctx.guild), view=LeaveView(cfg, ctx.guild, ctx.author))
 
 @bot.command(name="reactauto")
-@commands.has_permissions(manage_guild=True)
+@is_authorized()
 async def reactauto_cmd(ctx):
     """Panneau config réactions automatiques."""
     cfg = guild_config(ctx.guild.id)
@@ -762,17 +841,22 @@ async def help_cmd(ctx):
     embed.add_field(name="⚙️ !config", value="Voir toute la configuration actuelle", inline=False)
     embed.add_field(name="🧪 !testwelcome", value="Simuler une arrivée de membre", inline=False)
     embed.add_field(
-        name="🎨 Personnalisation du bot (propriétaire uniquement)",
+        name="🎨 Personnalisation du bot (owners uniquement)",
         value="`!setpp <lien ou image>` — photo de profil\n"
               "`!setbanner <lien ou image>` — bannière\n"
               "`!setbio <texte>` — bio / description",
+        inline=False
+    )
+    embed.add_field(
+        name="👑 !owner <@membre> [remove]",
+        value="Donne ou retire **tous les droits** à quelqu'un — réservé au créateur du bot",
         inline=False
     )
     embed.set_footer(text="Préfixe : !")
     await ctx.send(embed=embed)
 
 @bot.command(name="config")
-@commands.has_permissions(manage_guild=True)
+@is_authorized()
 async def config_cmd(ctx):
     cfg = guild_config(ctx.guild.id)
     e1 = build_join_embed(cfg, ctx.guild)
@@ -786,7 +870,7 @@ async def config_cmd(ctx):
     await ctx.send(embeds=[e1, e1b, e2, e3])
 
 @bot.command(name="testwelcome")
-@commands.has_permissions(manage_guild=True)
+@is_authorized()
 async def test_welcome(ctx):
     await on_member_join(ctx.author)
     await ctx.send(embed=e_ok("Test envoyé !"), delete_after=4)
