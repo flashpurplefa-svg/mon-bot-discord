@@ -1,6 +1,7 @@
 import discord
 from discord.ext import commands
-import json, os, time, asyncio, re, datetime
+from discord.http import Route
+import json, os, time, asyncio, re, datetime, aiohttp
 from collections import defaultdict
 
 # ─────────────────────────────────────────
@@ -74,6 +75,25 @@ def parse_emoji_token(token):
             return token
     return token
 
+async def fetch_image_bytes(url):
+    """Télécharge une image depuis une URL et retourne ses bytes (ou None en cas d'échec)."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    return None
+                return await resp.read()
+    except Exception:
+        return None
+
+async def get_image_from_ctx(ctx, url):
+    """Récupère une image soit depuis une pièce jointe, soit depuis une URL fournie."""
+    if ctx.message.attachments:
+        return await ctx.message.attachments[0].read()
+    if url:
+        return await fetch_image_bytes(url)
+    return None
+
 # ─────────────────────────────────────────
 #  EVENTS
 # ─────────────────────────────────────────
@@ -118,6 +138,22 @@ async def on_member_join(member):
                 await member.add_roles(role)
             except discord.Forbidden:
                 pass
+
+@bot.event
+async def on_member_remove(member):
+    cfg = guild_config(member.guild.id)
+
+    if cfg.get("leave_channel"):
+        ch = member.guild.get_channel(cfg["leave_channel"])
+        if ch:
+            msg = cfg.get("leave_message", "{name} a quitté **{server}**. 👋")
+            msg = msg.replace("{mention}", member.mention)\
+                     .replace("{name}", member.name)\
+                     .replace("{server}", member.guild.name)\
+                     .replace("{count}", str(member.guild.member_count))
+            embed = discord.Embed(description=msg, color=0x95a5a6)
+            embed.set_thumbnail(url=member.display_avatar.url)
+            await ch.send(embed=embed)
 
 @bot.event
 async def on_message(message):
@@ -364,6 +400,86 @@ class JoinView(discord.ui.View):
 
 
 # ═══════════════════════════════════════════════════════════
+#  VIEW : !leave  (Message de départ des membres)
+# ═══════════════════════════════════════════════════════════
+
+def build_leave_embed(cfg, guild):
+    embed = discord.Embed(
+        title="👋 Config — Départ des membres",
+        description="Clique sur un bouton pour modifier un paramètre.\nChangements sauvegardés **immédiatement**.",
+        color=0x95a5a6
+    )
+    lc = cfg.get("leave_channel")
+    embed.add_field(name="📢 Salon départ",
+        value=f"<#{lc}>" if lc else "❌ Non configuré", inline=True)
+
+    embed.add_field(name="\u200b", value="\u200b", inline=True)
+    embed.add_field(name="\u200b", value="\u200b", inline=True)
+
+    lm = cfg.get("leave_message", "*(par défaut)*")
+    embed.add_field(name="💬 Message salon",
+        value=f"```{lm[:100]}```", inline=False)
+
+    embed.set_footer(text="Variables : {mention} {name} {server} {count}  •  Expire dans 5 min")
+    return embed
+
+
+class LeaveView(discord.ui.View):
+    def __init__(self, cfg, guild, author):
+        super().__init__(timeout=300)
+        self.cfg    = cfg
+        self.guild  = guild
+        self.author = author
+
+    def is_author(self, interaction):
+        return interaction.user.id == self.author.id
+
+    async def _refresh(self, interaction):
+        await interaction.message.edit(
+            embed=build_leave_embed(self.cfg, self.guild),
+            view=LeaveView(self.cfg, self.guild, self.author)
+        )
+
+    # ── Salon départ ──
+    @discord.ui.button(label="📢 Salon départ", style=discord.ButtonStyle.primary, row=0)
+    async def btn_ch(self, interaction: discord.Interaction, _):
+        if not self.is_author(interaction): return await interaction.response.send_message("❌", ephemeral=True)
+        await interaction.response.send_message("Mentionne le **salon de départ** (#salon) ou `disable` :", ephemeral=True)
+        msg = await wait_response(bot, self.author, interaction.channel)
+        if not msg: return
+        if msg.content.lower() == "disable":
+            self.cfg.pop("leave_channel", None)
+        elif msg.channel_mentions:
+            self.cfg["leave_channel"] = msg.channel_mentions[0].id
+        save_config(config)
+        try: await msg.delete()
+        except: pass
+        await self._refresh(interaction)
+
+    # ── Message salon ──
+    @discord.ui.button(label="💬 Message salon", style=discord.ButtonStyle.primary, row=0)
+    async def btn_msg(self, interaction: discord.Interaction, _):
+        if not self.is_author(interaction): return await interaction.response.send_message("❌", ephemeral=True)
+        await interaction.response.send_message(
+            "Envoie le **message de départ** :\n`{mention}` `{name}` `{server}` `{count}`", ephemeral=True)
+        msg = await wait_response(bot, self.author, interaction.channel)
+        if not msg: return
+        self.cfg["leave_message"] = msg.content
+        save_config(config)
+        try: await msg.delete()
+        except: pass
+        await self._refresh(interaction)
+
+    # ── Test départ ──
+    @discord.ui.button(label="🧪 Tester", style=discord.ButtonStyle.success, row=1)
+    async def btn_test(self, interaction: discord.Interaction, _):
+        if not self.is_author(interaction): return await interaction.response.send_message("❌", ephemeral=True)
+        await interaction.response.defer()
+        await on_member_remove(interaction.user)
+        await interaction.channel.send(embed=e_ok("Test envoyé !"), delete_after=4)
+
+
+# ═══════════════════════════════════════════════════════════
 #  VIEW : !mod  (Anti-spam / Anti-mention / Anti-link)
 # ═══════════════════════════════════════════════════════════
 
@@ -560,6 +676,51 @@ class ReactAutoView(discord.ui.View):
 
 
 # ─────────────────────────────────────────
+#  COMMANDES — PERSONNALISATION DU BOT (owner only)
+# ─────────────────────────────────────────
+
+@bot.command(name="setpp")
+@commands.is_owner()
+async def setpp_cmd(ctx, url: str = None):
+    """Change la photo de profil du bot. Lien direct ou image en pièce jointe."""
+    image_bytes = await get_image_from_ctx(ctx, url)
+    if not image_bytes:
+        return await ctx.send(embed=e_err("Fournis un **lien direct** vers une image, ou attache une image au message."))
+    try:
+        await bot.user.edit(avatar=image_bytes)
+        await ctx.send(embed=e_ok("Photo de profil mise à jour !"))
+    except discord.HTTPException as e:
+        await ctx.send(embed=e_err(f"Discord a refusé l'image ({e})."))
+
+@bot.command(name="setbanner")
+@commands.is_owner()
+async def setbanner_cmd(ctx, url: str = None):
+    """Change la bannière du bot. Lien direct ou image en pièce jointe."""
+    image_bytes = await get_image_from_ctx(ctx, url)
+    if not image_bytes:
+        return await ctx.send(embed=e_err("Fournis un **lien direct** vers une image, ou attache une image au message."))
+    try:
+        await bot.user.edit(banner=image_bytes)
+        await ctx.send(embed=e_ok("Bannière mise à jour !"))
+    except discord.HTTPException as e:
+        await ctx.send(embed=e_err(f"Discord a refusé l'image ({e})."))
+
+@bot.command(name="setbio")
+@commands.is_owner()
+async def setbio_cmd(ctx, *, texte: str = None):
+    """Change la bio (description) du bot affichée sur son profil."""
+    if not texte:
+        return await ctx.send(embed=e_err("Fournis un texte. Ex : `!setbio Le bot officiel d'Horizon RP !`"))
+    if len(texte) > 400:
+        return await ctx.send(embed=e_err("Le texte est trop long (max 400 caractères)."))
+    try:
+        await bot.http.request(Route("PATCH", "/applications/@me"), json={"description": texte})
+        await ctx.send(embed=e_ok("Bio mise à jour !", texte))
+    except discord.HTTPException as e:
+        await ctx.send(embed=e_err(f"Discord a refusé la modification ({e})."))
+
+
+# ─────────────────────────────────────────
 #  COMMANDES PRINCIPALES
 # ─────────────────────────────────────────
 
@@ -577,6 +738,13 @@ async def mod_cmd(ctx):
     cfg = guild_config(ctx.guild.id)
     await ctx.send(embed=build_mod_embed(cfg), view=ModView(cfg, ctx.author))
 
+@bot.command(name="leave")
+@commands.has_permissions(manage_guild=True)
+async def leave_cmd(ctx):
+    """Panneau config départ membres."""
+    cfg = guild_config(ctx.guild.id)
+    await ctx.send(embed=build_leave_embed(cfg, ctx.guild), view=LeaveView(cfg, ctx.guild, ctx.author))
+
 @bot.command(name="reactauto")
 @commands.has_permissions(manage_guild=True)
 async def reactauto_cmd(ctx):
@@ -588,10 +756,18 @@ async def reactauto_cmd(ctx):
 async def help_cmd(ctx):
     embed = discord.Embed(title="📖 Commandes disponibles", color=0x9b59b6)
     embed.add_field(name="🎉 !join", value="Panneau interactif : salon bienvenue, message, MP, rôle auto, image only", inline=False)
+    embed.add_field(name="👋 !leave", value="Panneau interactif : salon départ, message de départ", inline=False)
     embed.add_field(name="🛡️ !mod", value="Panneau interactif : anti-spam, anti-mention, anti-link", inline=False)
     embed.add_field(name="🤖 !reactauto", value="Panneau interactif : réactions automatiques par salon", inline=False)
     embed.add_field(name="⚙️ !config", value="Voir toute la configuration actuelle", inline=False)
     embed.add_field(name="🧪 !testwelcome", value="Simuler une arrivée de membre", inline=False)
+    embed.add_field(
+        name="🎨 Personnalisation du bot (propriétaire uniquement)",
+        value="`!setpp <lien ou image>` — photo de profil\n"
+              "`!setbanner <lien ou image>` — bannière\n"
+              "`!setbio <texte>` — bio / description",
+        inline=False
+    )
     embed.set_footer(text="Préfixe : !")
     await ctx.send(embed=embed)
 
@@ -601,11 +777,13 @@ async def config_cmd(ctx):
     cfg = guild_config(ctx.guild.id)
     e1 = build_join_embed(cfg, ctx.guild)
     e1.title = "⚙️ Config — Arrivée"
+    e1b = build_leave_embed(cfg, ctx.guild)
+    e1b.title = "⚙️ Config — Départ"
     e2 = build_mod_embed(cfg)
     e2.title = "⚙️ Config — Modération"
     e3 = build_reactauto_embed(cfg, ctx.guild)
     e3.title = "⚙️ Config — Réactions auto"
-    await ctx.send(embeds=[e1, e2, e3])
+    await ctx.send(embeds=[e1, e1b, e2, e3])
 
 @bot.command(name="testwelcome")
 @commands.has_permissions(manage_guild=True)
@@ -621,6 +799,8 @@ async def test_welcome(ctx):
 async def on_command_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
         await ctx.send(embed=e_err("Permission refusée."))
+    elif isinstance(error, commands.NotOwner):
+        await ctx.send(embed=e_err("Commande réservée au propriétaire du bot."))
     elif isinstance(error, commands.MissingRequiredArgument):
         await ctx.send(embed=e_err("Argument manquant. Tape `!help`"))
     elif isinstance(error, commands.BadArgument):
